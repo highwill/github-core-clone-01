@@ -1,6 +1,5 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// port it bound, then poll until the env says the trial is over and exit 0.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
@@ -14,7 +13,13 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// The server app.ts builds is the forge itself: one process serving git smart HTTP (protocol v2
+// upload-pack, v0 receive-pack), the REST v3 API, GraphQL v4 and an MCP endpoint over a single
+// in-memory store — no UI, no outside services, no git binary. main.ts only owns the lifecycle;
+// the scored behaviour lives in app.ts, rest.ts, gitproto.ts, graphql.ts and mcp.ts.
+//
+// A signal (SIGTERM/SIGINT, how a trial container stops the entry) also closes the server and exits
+// 0: the trial is over either way, and a half-open socket must not outlive the process.
 
 import { createApp } from './app.ts';
 
@@ -86,6 +91,20 @@ async function main(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
+
+  // A stop signal ends the trial: close the server and leave cleanly rather
+  // than dying with a half-open socket. The /done poll is the normal exit;
+  // this is only the container's way of saying the trial is over.
+  let stopping = false;
+  const stop = (): void => {
+    if (stopping) return;
+    stopping = true;
+    server.close(() => process.exit(0));
+    // If the socket does not drain, do not hang the harness: exit anyway.
+    setTimeout(() => process.exit(0), 2_000).unref();
+  };
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
