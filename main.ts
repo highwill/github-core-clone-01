@@ -15,8 +15,10 @@
 //
 // The server app.ts builds is the forge itself: one process serving git smart HTTP (protocol v2
 // upload-pack, v0 receive-pack), the REST v3 API, GraphQL v4 and an MCP endpoint over a single
-// in-memory store — no UI, no outside services, no git binary. main.ts only owns the lifecycle;
-// the scored behaviour lives in app.ts, rest.ts, gitproto.ts, graphql.ts and mcp.ts.
+// in-memory store — no UI, no outside services, no git binary. Its transport is a hand-rolled
+// HTTP/1.1 server over node:net (rawhttp.ts), chosen over node:http for its lower per-request
+// cost; main.ts only owns the lifecycle; the scored behaviour lives in app.ts, rest.ts,
+// gitproto.ts, graphql.ts and mcp.ts.
 //
 // A signal (SIGTERM/SIGINT, how a trial container stops the entry) also closes the server and exits
 // 0: the trial is over either way, and a half-open socket must not outlive the process.

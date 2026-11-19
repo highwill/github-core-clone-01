@@ -262,8 +262,10 @@ function callTool(
       labels: [],
       comments: [],
       seq: repo.seq++,
+      cachedJson: null,
     };
     repo.issues.set(issue.number, issue);
+    repo.openIssueCount += 1;
     return toolOk(issueJson(repo, issue, base));
   }
 

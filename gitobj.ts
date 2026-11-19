@@ -5,6 +5,12 @@
 // Packs this forge writes carry full objects only, never deltas: every git
 // client accepts them, and the bytes are deterministic for a given object set
 // (fixed order, fixed zlib level), which keeps the clone workload cacheable.
+//
+// Hot-path note: the fetch closure walks the same 200-commit history on
+// every one of the clone workload's 50 concurrent fetches. Objects are
+// immutable by oid, so a commit's parsed headers are cached per object map
+// (commitInfo) and never parsed twice; the same holds for nothing else,
+// because trees in these workloads are one-entry and cheap to re-parse.
 
 import { createHash, randomBytes } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -99,6 +105,31 @@ export function parseCommit(data: Buffer): CommitInfo {
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
   return { tree, parents, author, committer, message };
+}
+
+/**
+ * A commit's parsed headers, cached per object map. Git objects are
+ * immutable by oid, so the first parse of an oid is the only one: the
+ * fetch closure and the ancestry walk both re-read the same commits on
+ * every operation of a workload, and this is what keeps that O(1) after
+ * the first pass. The cache is keyed by the repo's objects map, so two
+ * repos never share entries and a deleted repo's cache is collectable.
+ */
+const commitInfoCache = new WeakMap<Map<string, GitObject>, Map<string, CommitInfo>>();
+
+export function commitInfo(objects: Map<string, GitObject>, oid: string): CommitInfo | null {
+  let perRepo = commitInfoCache.get(objects);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, CommitInfo>();
+    commitInfoCache.set(objects, perRepo);
+  }
+  let info = perRepo.get(oid);
+  if (info !== undefined) return info;
+  const obj = objects.get(oid.toLowerCase());
+  if (obj === undefined || obj.type !== 'commit') return null;
+  info = parseCommit(obj.data);
+  perRepo.set(oid, info);
+  return info;
 }
 
 // ---------------------------------------------------------------- tags

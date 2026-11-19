@@ -29,8 +29,20 @@
 //   anything else is `ng <ref> non-fast-forward` and moves nothing;
 // - the report is `unpack ok` + one ok/ng line per command, framed in
 //   sideband band 1 when the client asked for side-band-64k.
+//
+// Perf notes (the clone workload runs 50 concurrent depth-1 fetches of a
+// 200-commit repo, the push workload 200 sequential receive-packs):
+// - the v2 capability advertisement never changes: one constant buffer.
+// - the v0 advertisement depends only on the refs: cached per repo and
+//   rebuilt only when refsVersion moves (a push or a ref create).
+// - the fetch closure's generation BFS used to walk the whole history on
+//   every fetch; it now stops at the depth boundary (a depth-1 fetch reads
+//   one generation) and is skipped entirely for a full fetch, where no
+//   shallow-info is ever emitted; its queue is an index pointer, not
+//   shift(). Commit headers come from gitobj's per-map cache, so the
+//   repeated walks over one history parse each commit once.
 
-import { getObject, hashObject, parseCommit, parsePack, parseTag, parseTree, pktLine, FLUSH_PKT, writePack } from './gitobj.ts';
+import { commitInfo, getObject, hashObject, parseCommit, parsePack, parseTag, parseTree, pktLine, FLUSH_PKT, writePack } from './gitobj.ts';
 import type { GitObject } from './store.ts';
 import type { Repo, Store } from './store.ts';
 import { isAncestor } from './gitutil.ts';
@@ -81,7 +93,8 @@ function peelToCommit(repo: Repo, oid: string): string | null {
 // advertisements
 // ---------------------------------------------------------------------------
 
-function v2UploadAdvertisement(): Buffer {
+/** The v2 capability advertisement: constant bytes, built once. */
+const V2_UPLOAD_ADVERTISEMENT: Buffer = (() => {
   const lines = [
     '# service=git-upload-pack\n',
     'version 2\n',
@@ -96,9 +109,9 @@ function v2UploadAdvertisement(): Buffer {
   for (const line of lines.slice(1)) parts.push(pktText(line));
   parts.push(FLUSH_PKT);
   return Buffer.concat(parts);
-}
+})();
 
-function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+function buildV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
     service === 'git-upload-pack'
       ? `upload-pack side-band-64k ofs-delta thin-pack multi_ack shallow symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`
@@ -123,6 +136,19 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   }
   parts.push(FLUSH_PKT);
   return Buffer.concat(parts);
+}
+
+/**
+ * The v0 advertisement for a repo and service, cached while the refs stand
+ * still. A push advertises before every receive-pack, and the bytes only
+ * change when a ref moves, which bumps refsVersion at the mutation site.
+ */
+function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cached = repo.adCache.get(service);
+  if (cached !== undefined && cached.version === repo.refsVersion) return cached.body;
+  const body = buildV0Advertisement(repo, service);
+  repo.adCache.set(service, { version: repo.refsVersion, body });
+  return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +198,8 @@ function heldSet(repo: Repo, haves: readonly string[], clientShallow: ReadonlySe
       return;
     }
     out.add(oid);
-    const info = parseCommit(obj.data);
+    const info = commitInfo(repo.objects, oid);
+    if (info === null) return;
     addTreeDeep(info.tree);
     if (clientShallow.has(oid)) return; // the boundary: parents are not held
     for (const parent of info.parents) addCommitDeep(parent);
@@ -193,6 +220,12 @@ function fullClosure(repo: Repo, tips: readonly string[]): Set<string> {
  * Returns the object map plus, per delivered commit, its generation (0 =
  * a wanted commit) for the shallow boundary, computed by a shortest-path
  * BFS from the wants over the delivered commits.
+ *
+ * The generations map is only read when a depth is set (the shallow-info
+ * block), and only generations up to depth - 1 are ever read: the BFS
+ * stops expanding past the boundary, so a depth-1 fetch of a 200-commit
+ * repo reads one generation instead of walking the whole history. A full
+ * fetch skips the BFS entirely.
  */
 function fetchClosure(
   repo: Repo,
@@ -244,7 +277,8 @@ function fetchClosure(
     }
     if (options.depth !== undefined && gen >= options.depth) return;
     addObject(oid);
-    const info = parseCommit(obj.data);
+    const info = commitInfo(repo.objects, oid);
+    if (info === null) return;
     addTree(info.tree);
     for (const parent of info.parents) addCommit(parent, gen + 1);
   };
@@ -253,23 +287,28 @@ function fetchClosure(
 
   // Shortest-path generations over the commit graph from the wants (a
   // want's own generation is 0 even when the want itself is already held,
-  // as in a deepen fetch). The boundary is read off these, not off the
-  // delivered set alone.
+  // as in a deepen fetch). Only generations up to depth - 1 are ever read,
+  // and a full fetch reads none — so the BFS expands no further than the
+  // boundary and is skipped outright without a depth. The queue is an
+  // index pointer: shift() would make this walk quadratic in the history.
   const generations = new Map<string, number>();
-  const queue: Array<{ oid: string; gen: number }> = [];
-  for (const want of wants) {
-    const obj = getObject(repo, want);
-    if (obj === undefined) continue;
-    if (obj.type === 'tag') queue.push({ oid: parseTag(obj.data).object, gen: 0 });
-    else if (obj.type === 'commit') queue.push({ oid: want, gen: 0 });
-  }
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift() as { oid: string; gen: number };
-    if (generations.has(oid)) continue;
-    generations.set(oid, gen);
-    const obj = getObject(repo, oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    for (const parent of parseCommit(obj.data).parents) queue.push({ oid: parent, gen: gen + 1 });
+  if (options.depth !== undefined) {
+    const queue: Array<{ oid: string; gen: number }> = [];
+    for (const want of wants) {
+      const obj = getObject(repo, want);
+      if (obj === undefined) continue;
+      if (obj.type === 'tag') queue.push({ oid: parseTag(obj.data).object, gen: 0 });
+      else if (obj.type === 'commit') queue.push({ oid: want, gen: 0 });
+    }
+    for (let head = 0; head < queue.length; head += 1) {
+      const { oid, gen } = queue[head] as { oid: string; gen: number };
+      if (generations.has(oid)) continue;
+      generations.set(oid, gen);
+      if (gen >= (options.depth as number) - 1) continue;
+      const info = commitInfo(repo.objects, oid);
+      if (info === null) continue;
+      for (const parent of info.parents) queue.push({ oid: parent, gen: gen + 1 });
+    }
   }
   return { objects, generations };
 }
@@ -396,11 +435,10 @@ function handleFetch(repo: Repo, lines: readonly string[]): GitResult {
     const unshallow: string[] = [];
     for (const oid of clientShallow) {
       if (shallow.includes(oid)) continue;
-      const obj = getObject(repo, oid);
-      if (obj === undefined || obj.type !== 'commit') continue;
-      const parents = parseCommit(obj.data).parents;
+      const info = commitInfo(repo.objects, oid);
+      if (info === null) continue;
       const deliveredOrHeld = new Set([...objects.keys(), ...haves]);
-      if (parents.every((p) => deliveredOrHeld.has(p))) unshallow.push(oid);
+      if (info.parents.every((p) => deliveredOrHeld.has(p))) unshallow.push(oid);
     }
     if (shallow.length > 0 || unshallow.length > 0) {
       parts.push(pktText('shallow-info\n'));
@@ -510,6 +548,7 @@ function handleReceivePack(repo: Repo, body: Buffer): GitResult {
           reportLines.push(`ng ${command.ref} non-fast-forward\n`);
         } else {
           repo.refs.delete(command.ref);
+          repo.refsVersion += 1;
           reportLines.push(`ok ${command.ref}\n`);
         }
         continue;
@@ -522,6 +561,7 @@ function handleReceivePack(repo: Repo, body: Buffer): GitResult {
           reportLines.push(`ng ${command.ref} missing object\n`);
         } else {
           repo.refs.set(command.ref, command.newOid);
+          repo.refsVersion += 1;
           reportLines.push(`ok ${command.ref}\n`);
         }
         continue;
@@ -535,6 +575,7 @@ function handleReceivePack(repo: Repo, body: Buffer): GitResult {
         reportLines.push(`ng ${command.ref} missing object\n`);
       } else if (command.newOid === current || isAncestor(repo, command.newOid, current)) {
         repo.refs.set(command.ref, command.newOid);
+        repo.refsVersion += 1;
         reportLines.push(`ok ${command.ref}\n`);
       } else {
         reportLines.push(`ng ${command.ref} non-fast-forward\n`);
@@ -590,7 +631,7 @@ export function handleGit(
     const requested = query.get('service');
     if (requested === 'git-upload-pack') {
       const v2 = (headers['git-protocol'] as string | undefined) === 'version=2';
-      if (v2) return { status: 200, body: v2UploadAdvertisement(), contentType: 'application/x-git-upload-pack-advertisement' };
+      if (v2) return { status: 200, body: V2_UPLOAD_ADVERTISEMENT, contentType: 'application/x-git-upload-pack-advertisement' };
       return { status: 200, body: v0Advertisement(repo, 'git-upload-pack'), contentType: 'application/x-git-upload-pack-advertisement' };
     }
     if (requested === 'git-receive-pack') {

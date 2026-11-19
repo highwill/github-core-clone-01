@@ -594,8 +594,10 @@ function createIssueInStore(ctx: GqlContext, repo: Repo, title: string, body: st
     labels: [],
     comments: [],
     seq: repo.seq++,
+    cachedJson: null,
   };
   repo.issues.set(issue.number, issue);
+  repo.openIssueCount += 1;
   return issue;
 }
 
@@ -779,7 +781,9 @@ function resolveField(ctx: GqlContext, parent: AnyObj, field: FieldNode, path: A
       const repo = repoById(ctx, Number(decoded.parts[0]));
       const issue = repo?.issues.get(Number(decoded.parts[1]));
       if (repo === undefined || repo === null || issue === undefined) throw new FieldError('Could not resolve to a node with the global id of the issue.');
+      if (issue.state === 'open') repo.openIssueCount -= 1;
       issue.state = 'closed';
+      issue.cachedJson = null;
       return { __typename: 'CloseIssuePayload', issue: issueObj(repo, issue) };
     }
     if (name === 'createPullRequest') {
@@ -810,6 +814,7 @@ function resolveField(ctx: GqlContext, parent: AnyObj, field: FieldNode, path: A
       if (repo === undefined || repo === null || issue === undefined) throw new FieldError('Could not resolve to a node with the global id of the subject.');
       const comment = { id: repo.nextComment++, body: String(input.body ?? '') };
       issue.comments.push(comment);
+      issue.cachedJson = null;
       return {
         __typename: 'AddCommentPayload',
         commentEdge: { __typename: 'IssueCommentEdge', node: commentObj(repo, issue, comment), cursor: cursorOf(String(comment.id)) },

@@ -1,8 +1,13 @@
 // Git graph helpers over the store: tree read/write by path, commit
 // ancestry, diffs, merge-base, and the three-way conflict test the pull
 // merge endpoint uses. All pure functions of the stored objects.
+//
+// Hot-path note: ancestry walks read commit headers through gitobj's
+// commitInfo cache, so a repeated walk over the same history parses each
+// commit once; the push workload's fast-forward check stays one step on a
+// linear history either way.
 
-import { buildTree, getObject, hashObject, parseCommit, parseTag, parseTree, storeObject } from './gitobj.ts';
+import { buildTree, commitInfo, getObject, hashObject, parseCommit, parseTag, parseTree, storeObject } from './gitobj.ts';
 import type { Repo } from './store.ts';
 import type { GitObject, ObjectType } from './store.ts';
 
@@ -104,15 +109,13 @@ export function commitChain(repo: Repo, tipOid: string, cap = 10000): string[] {
   while (current !== null && current !== '' && !seen.has(current) && out.length < cap) {
     seen.add(current);
     out.push(current);
-    const obj = getObject(repo, current);
-    if (obj === undefined || obj.type !== 'commit') break;
-    const info = parseCommit(obj.data);
+    const info = commitInfo(repo.objects, current);
+    if (info === null) break;
     current = info.parents.length > 0 ? (info.parents[0] as string) : null;
   }
   return out;
 }
 
-/** The set of commits reachable from `tipOid` (all parents), capped. */
 /**
  * Whether `ancestor` is reachable from `descendant` by following commit
  * parents (a merge walks every parent). Stops the moment the ancestor is
@@ -139,7 +142,9 @@ export function isAncestor(repo: Repo, descendant: string, ancestor: string): bo
       continue;
     }
     if (obj.type !== 'commit') continue;
-    for (const parent of parseCommit(obj.data).parents) {
+    const info = commitInfo(repo.objects, oid);
+    if (info === null) continue;
+    for (const parent of info.parents) {
       if (parent === ancestor) return true;
       if (!seen.has(parent)) {
         seen.add(parent);
@@ -150,16 +155,17 @@ export function isAncestor(repo: Repo, descendant: string, ancestor: string): bo
   return false;
 }
 
+/** The set of commits reachable from `tipOid` (all parents), capped. */
 export function reachableSet(repo: Repo, tipOid: string, cap = 100000): Set<string> {
   const seen = new Set<string>();
   const stack: string[] = [tipOid];
   while (stack.length > 0 && seen.size < cap) {
     const oid = stack.pop() as string;
     if (oid === '' || seen.has(oid)) continue;
-    const obj = getObject(repo, oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const info = commitInfo(repo.objects, oid);
+    if (info === null) continue;
     seen.add(oid);
-    for (const p of parseCommit(obj.data).parents) stack.push(p);
+    for (const p of info.parents) stack.push(p);
   }
   return seen;
 }
@@ -196,12 +202,14 @@ export function diffTrees(repo: Repo, oldTreeOid: string | null, newTreeOid: str
  * content also moved since the base, conflicts.
  */
 export function mergeConflicts(repo: Repo, baseOid: string | null, headTip: string, baseTip: string): string[] {
-  const headInfo = getObject(repo, headTip);
-  const baseInfo = getObject(repo, baseTip);
-  if (headInfo === undefined || baseInfo === undefined) return [];
-  const baseTree = baseOid === null ? null : parseCommit(getObject(repo, baseOid)?.data ?? Buffer.alloc(0)).tree;
-  const headTree = parseCommit(headInfo.data).tree;
-  const tipTree = parseCommit(baseInfo.data).tree;
+  const headObj = getObject(repo, headTip);
+  const baseObj = getObject(repo, baseTip);
+  if (headObj === undefined || baseObj === undefined) return [];
+  // A non-commit tip parses to an empty tree, as parseCommit would give it;
+  // commit tips take the cached headers.
+  const baseTree = baseOid === null ? null : (commitInfo(repo.objects, baseOid)?.tree ?? '');
+  const headTree = commitInfo(repo.objects, headTip)?.tree ?? '';
+  const tipTree = commitInfo(repo.objects, baseTip)?.tree ?? '';
   const headChanges = diffTrees(repo, baseTree, headTree);
   const tipMap = flattenTree(repo, tipTree);
   const baseMap = baseTree === null ? new Map<string, string>() : flattenTree(repo, baseTree);
@@ -216,9 +224,7 @@ export function mergeConflicts(repo: Repo, baseOid: string | null, headTip: stri
 
 /** The tree oid of a commit ('' when the commit is missing). */
 export function commitTree(repo: Repo, commitOid: string): string {
-  const obj = getObject(repo, commitOid);
-  if (obj === undefined || obj.type !== 'commit') return '';
-  return parseCommit(obj.data).tree;
+  return commitInfo(repo.objects, commitOid)?.tree ?? '';
 }
 
 /** Line counts of a blob, for pull-file additions/deletions. */

@@ -10,6 +10,19 @@
 // - every reply carries X-GitHub-Request-Id (the server adds it);
 // - extra fields are allowed by the suite, so responses carry the usual
 //   GitHub fields; the fields the checks read are exact.
+//
+// Perf notes (the read workload GETs one issue 2,000 times, the write
+// workload creates 200 issues, both sequential on one connection):
+// - a single issue's serialized JSON is cached on the issue and rebuilt
+//   only when it mutates (state change, new comment): the read workload's
+//   2,000 GETs serialize once. The cache key includes the base URL, so a
+//   different Host still gets a correct body.
+// - label ids are assigned at creation, so label JSON never scans the
+//   label map for an index.
+// - the open-issue count is maintained on the repo, so repo JSON never
+//   scans the issue map.
+// - makeCommit and the git-refs endpoint bump refsVersion, keeping the
+//   git advertisement cache honest.
 
 import { buildCommit, getObject, parseCommit, parseTree, storeObject } from './gitobj.ts';
 import {
@@ -31,6 +44,9 @@ export interface RestResult {
   readonly status: number;
   readonly body: unknown;
   readonly headers?: Record<string, string>;
+  /** Pre-serialized JSON body (with trailing newline, as sendJson writes it):
+   * when set, the server sends it verbatim instead of stringifying `body`. */
+  readonly rawText?: string;
 }
 
 const EPOCH_ISO = new Date(1_735_689_600 * 1000).toISOString();
@@ -71,7 +87,7 @@ function repoJson(repo: Repo, base: string): Record<string, unknown> {
     has_wiki: false,
     has_pages: false,
     forks_count: 0,
-    open_issues_count: [...repo.issues.values()].filter((i) => i.state === 'open').length,
+    open_issues_count: repo.openIssueCount,
     license: null,
     default_branch: repo.defaultBranch,
     visibility: repo.private ? 'private' : 'public',
@@ -85,10 +101,10 @@ function repoJson(repo: Repo, base: string): Record<string, unknown> {
 
 function labelJson(repo: Repo, name: string): Record<string, unknown> {
   const label = repo.labels.get(name);
-  const names = [...repo.labels.keys()];
+  const id = label?.id ?? 0;
   return {
-    id: names.indexOf(name) + 1,
-    node_id: `label-${repo.id}-${names.indexOf(name) + 1}`,
+    id,
+    node_id: `label-${repo.id}-${id}`,
     name,
     color: label?.color ?? 'ededed',
     description: '',
@@ -116,6 +132,27 @@ function issueJson(repo: Repo, issue: Issue, base: string): Record<string, unkno
     html_url: `${base}/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `${base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/**
+ * The serialized form of one issue, cached on the issue. The text carries
+ * the trailing newline sendJson appends, so a cache hit is byte-identical
+ * to a fresh build. The cache is filled on create and on a GET miss, and
+ * cleared whenever the issue mutates (PATCH state, new comment).
+ */
+function issueText(repo: Repo, issue: Issue, base: string): string {
+  // cachedJson may be undefined for an issue another surface built before
+  // the cache existed; treat any non-object as a miss.
+  const cached = issue.cachedJson;
+  if (cached !== null && cached !== undefined && cached.base === base) return cached.text;
+  const text = `${JSON.stringify(issueJson(repo, issue, base))}\n`;
+  issue.cachedJson = { base, text, length: Buffer.byteLength(text) };
+  return text;
+}
+
+/** Answer a single-issue GET/POST/PATCH with the cached serialized form. */
+function issueResult(repo: Repo, issue: Issue, base: string, status: number): RestResult {
+  return { status, body: null, rawText: issueText(repo, issue, base) };
 }
 
 function pullJson(repo: Repo, pull: Pull, base: string): Record<string, unknown> {
@@ -207,6 +244,7 @@ export function makeCommit(
   });
   const oid = storeObject(repo, 'commit', data);
   repo.refs.set(`refs/heads/${branch}`, oid);
+  repo.refsVersion += 1;
   return oid;
 }
 
@@ -317,6 +355,7 @@ export function handleRest(
       }
       if (repo.refs.has(ref)) return err(422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      repo.refsVersion += 1;
       return ok(201, { ref, object: { sha, type: 'commit' }, url: `${base}/api/v3/repos/${owner}/${name}/git/refs/${encodeURIComponent(ref)}` });
     }
 
@@ -424,13 +463,14 @@ export function handleRest(
         const givenSha = typeof body?.sha === 'string' ? (body.sha as string).toLowerCase() : null;
         if (currentBlob !== '' && givenSha !== null && givenSha !== currentBlob) return err(409, 'Stale blob sha');
         if (currentBlob === '' && givenSha !== null) return err(409, 'Stale blob sha');
-        const blobOid = storeObject(repo, 'blob', b64decode(contentB64));
+        const content = b64decode(contentB64);
+        const blobOid = storeObject(repo, 'blob', content);
         const newTree = setPathInTree(repo, currentTree, path, blobOid);
         const parents = tipForBranch === null ? [] : [tipForBranch];
         const commitOid = makeCommit(store, repo, branch, newTree, message, parents);
         const status = currentBlob === '' ? 201 : 200;
         return ok(status, {
-          content: { name: path.split('/').pop(), path, sha: blobOid, size: b64decode(contentB64).length, type: 'file', encoding: 'base64' },
+          content: { name: path.split('/').pop(), path, sha: blobOid, size: content.length, type: 'file', encoding: 'base64' },
           commit: { sha: commitOid, message },
         });
       }
@@ -457,7 +497,7 @@ export function handleRest(
       const name = typeof body?.name === 'string' ? body.name : '';
       if (name === '') return err(422, 'name is required');
       const color = typeof body?.color === 'string' ? body.color : 'ededed';
-      if (!repo.labels.has(name)) repo.labels.set(name, { name, color });
+      if (!repo.labels.has(name)) repo.labels.set(name, { name, color, id: repo.nextLabel++ });
       return ok(201, labelJson(repo, name));
     }
 
@@ -479,9 +519,11 @@ export function handleRest(
             labels,
             comments: [],
             seq: repo.seq++,
+            cachedJson: null,
           };
           repo.issues.set(issue.number, issue);
-          return ok(201, issueJson(repo, issue, base));
+          repo.openIssueCount += 1;
+          return issueResult(repo, issue, base, 201);
         }
         if (method === 'GET') {
           const state = query.get('state') ?? 'open';
@@ -506,12 +548,18 @@ export function handleRest(
       if (rest.length === 2) {
         if (method === 'GET') {
           if (issue === undefined) return err(404, 'Not Found');
-          return ok(200, issueJson(repo, issue, base));
+          return issueResult(repo, issue, base, 200);
         }
         if (method === 'PATCH') {
           if (issue === undefined) return err(404, 'Not Found');
-          if (body?.state === 'open' || body?.state === 'closed') issue.state = body.state;
-          return ok(200, issueJson(repo, issue, base));
+          if (body?.state === 'open' || body?.state === 'closed') {
+            if (body.state !== issue.state) {
+              repo.openIssueCount += body.state === 'open' ? 1 : -1;
+              issue.state = body.state;
+              issue.cachedJson = null;
+            }
+          }
+          return issueResult(repo, issue, base, 200);
         }
         return err(404, 'Not Found');
       }
@@ -521,6 +569,7 @@ export function handleRest(
           const commentBody = typeof body?.body === 'string' ? body.body : '';
           const comment = { id: repo.nextComment++, body: commentBody };
           issue.comments.push(comment);
+          issue.cachedJson = null;
           return ok(201, {
             id: comment.id,
             body: comment.body,

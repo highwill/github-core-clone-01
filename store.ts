@@ -1,7 +1,17 @@
 // The forge's store: everything lives in memory, keyed for the workloads.
 // No filesystem writes happen on any request path — the trial mounts /bot
-// read-only, and the perf workloads (2,000 sequential reads, 200 writes) must
-// stay at Map-lookup cost.
+// read-only, and the perf workloads (2,000 sequential reads, 200 writes,
+// 200 pushes, 50 concurrent clones) must stay at Map-lookup cost.
+//
+// Two caches live here because the workloads repeat the same reads:
+// - Issue.cachedJson: the serialized issue JSON, rebuilt only when the issue
+//   mutates (state change, new comment). The read workload GETs one issue
+//   2,000 times; serializing it once is the whole win.
+// - Repo.adCache: the v0 advertisement bytes per service, keyed by the
+//   refs version — a push advertises before every receive-pack, and the
+//   bytes only change when a ref moves.
+// - Repo.openIssueCount: maintained on create/state change so repo JSON
+//   never scans the issue map for a count.
 
 export type ObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -24,6 +34,12 @@ export interface Issue {
   readonly comments: IssueComment[];
   /** Monotonic creation order, so created-asc/desc sorts are stable. */
   readonly seq: number;
+  /**
+   * Serialized issue JSON for the last base URL it was built for, or null
+   * when the issue mutated since. rest.ts rebuilds it on a miss and clears
+   * it on PATCH state / new comment; the body never changes after creation.
+   */
+  cachedJson: { base: string; text: string; length: number } | null;
 }
 
 export interface PullFile {
@@ -61,17 +77,26 @@ export interface Repo {
   readonly objects: Map<string, GitObject>;
   /** Full ref (refs/heads/...) -> oid (hex). */
   readonly refs: Map<string, string>;
-  /** Label name -> { name, color }. */
-  readonly labels: Map<string, { name: string; color: string }>;
+  /** Label name -> { name, color, id }. The id is assigned at creation so
+   * label JSON never scans the label map for an index. */
+  readonly labels: Map<string, { name: string; color: string; id: number }>;
   readonly issues: Map<number, Issue>;
   readonly pulls: Map<number, Pull>;
   nextIssue: number;
   nextPull: number;
   nextComment: number;
+  nextLabel: number;
   /** Creation order across issues and pulls (sort stability). */
   seq: number;
+  /** Open-issue count, maintained on create / state change. */
+  openIssueCount: number;
+  /** Bumped on every ref change; advertisement caches key off it. */
+  refsVersion: number;
   /** Cached fetch packs: key `${tip}:${depth}` -> pack bytes (deterministic build). */
   readonly packCache: Map<string, Buffer>;
+  /** Cached v0 advertisement bytes, keyed by service name; the entry also
+   * records the refsVersion it was built at. */
+  readonly adCache: Map<string, { version: number; body: Buffer }>;
 }
 
 export class Store {
@@ -104,8 +129,12 @@ export class Store {
       nextIssue: 1,
       nextPull: 1,
       nextComment: 1,
+      nextLabel: 1,
       seq: 0,
+      openIssueCount: 0,
+      refsVersion: 0,
       packCache: new Map(),
+      adCache: new Map(),
     };
     this.repos.set(this.repoKey(owner, name), repo);
     return repo;
